@@ -280,6 +280,10 @@ def importance_map(depth0, luma0, gmag, focus_center=None):
 def sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
+def logits_to_mask(logits):
+    u = np.tanh(logits)
+    return 0.5 * (1.0 + u)
+
 
 def bern_entropy(m):
     eps = 1e-9
@@ -309,11 +313,49 @@ def tv_and_grad(m, H, W, eta):
     g[1:, :]  += 2 * eta * dy[:-1, :]
     return tv, g.reshape(-1)
 
+def metric_reg_and_grad(m, G, H, W, gamma_metric):
+    if gamma_metric <= 0:
+        return 0.0, np.zeros_like(m)
 
-def mdl_loss_and_grad_logits(logits, e_eff, S0, H, W,
+    M = m.reshape(H, W)
+    if G.ndim == 1:
+        G = G.reshape(H, W)
+    dx = np.zeros_like(M)
+    dy = np.zeros_like(M)
+    dx[:, :-1] = M[:, 1:] - M[:, :-1]
+    dy[:-1, :] = M[1:, :] - M[:-1, :]
+
+    Gx = 0.5 * (G[:, 1:] + G[:, :-1])
+    Gy = 0.5 * (G[1:, :] + G[:-1, :])
+
+    reg = gamma_metric * (np.sum((Gx * dx[:, :-1]) ** 2) + np.sum((Gy * dy[:-1, :]) ** 2))
+
+    g = np.zeros_like(M)
+    g[:, :-1] -= 2 * gamma_metric * (Gx ** 2) * dx[:, :-1]
+    g[:, 1:]  += 2 * gamma_metric * (Gx ** 2) * dx[:, :-1]
+    g[:-1, :] -= 2 * gamma_metric * (Gy ** 2) * dy[:-1, :]
+    g[1:, :]  += 2 * gamma_metric * (Gy ** 2) * dy[:-1, :]
+
+    return reg, g.reshape(-1)
+
+def ternary_penalty_and_grad(u, gamma_tern):
+    if gamma_tern <= 0:
+        return 0.0, np.zeros_like(u)
+    a = u * u
+    f = a * (a - 1.0) * (a - 1.0)
+    val = gamma_tern * float(np.sum(f))
+    df_du = 2.0 * u * (a - 1.0) * (3.0 * a - 1.0)
+    return val, gamma_tern * df_du
+
+def mdl_loss_and_grad_logits(logits, e_eff, S0, I0, H, W,
                             lam=2.0, eta_tv=0.02,
-                            c_pos=0.10, c_neg=0.14):
-    m = sigmoid(logits)
+                            c_pos=0.10, c_neg=0.14,
+                            gamma_metric=0.03,
+                            beta_I=2.0,
+                            beta_S=1.0,
+                            gamma_tern=0.0):
+    u = np.tanh(logits)
+    m = 0.5 * (1.0 + u)
     rate = np.sum(bern_entropy(m))
     dH = d_bern_entropy_dm(m)
 
@@ -323,10 +365,17 @@ def mdl_loss_and_grad_logits(logits, e_eff, S0, H, W,
 
     tv, d_tv_dm = tv_and_grad(m, H, W, eta_tv)
 
-    loss = rate + comp + dist + tv
+    frontier = (np.abs(S0) > 0).astype(np.float32)
+    G = 1.0 + beta_I * I0 + beta_S * frontier
+    metric_reg, d_metric_dm = metric_reg_and_grad(m, G, H, W, gamma_metric)
 
-    dL_dm = dH + c_map - lam * e_eff + d_tv_dm
-    dlog = dL_dm * (m * (1.0 - m))
+    tern_val, d_tern_du = ternary_penalty_and_grad(u, gamma_tern)
+    loss = rate + comp + dist + tv + metric_reg + tern_val
+
+    dL_dm = dH + c_map - lam * e_eff + d_tv_dm + d_metric_dm
+    dm_du = 0.5
+    dL_du = dL_dm * dm_du + d_tern_du
+    dlog = dL_du * (1.0 - u * u)
     return loss, dlog, m
 
 
@@ -365,31 +414,191 @@ class TinyMLP:
         self.b2 -= lr * db2
 
 
-def train_logistic(X, e_eff, S0, H, W, epochs=200, lr=0.2, seed=0,
-                   lam=2.0, eta_tv=0.02, c_pos=0.10, c_neg=0.14):
+class KernelOperator:
+    def __init__(self, D, seed=0):
+        rng = np.random.default_rng(seed)
+        self.w = (0.01 * rng.standard_normal(D)).astype(np.float32)
+        self.b = np.float32(0.0)
+
+    def forward(self, X):
+        logits = X @ self.w + self.b
+        K = sigmoid(logits)
+        return K, logits
+
+    def step(self, dw, db, lr):
+        self.w -= lr * dw
+        self.b -= lr * db
+
+
+def metric_map_from_signals(I0, S0, beta_I=2.0, beta_S=1.0):
+    frontier = (np.abs(S0) > 0).astype(np.float32)
+    return (1.0 + beta_I * I0 + beta_S * frontier).astype(np.float32)
+
+
+def train_operator_stub(X, texture, target, S0, I0, H, W, epochs=200, lr=0.2,
+                        lam_mdl=0.05, gamma_metric=0.02, beta_I=2.0, beta_S=1.0, seed=0):
+    model = KernelOperator(X.shape[1], seed=seed)
+    G = metric_map_from_signals(I0.reshape(H, W), S0.reshape(H, W), beta_I=beta_I, beta_S=beta_S)
+
+    for _ in range(epochs):
+        K, logits = model.forward(X)
+        pred = K * texture
+        mse = np.mean((pred - target) ** 2)
+        mdl = lam_mdl * np.mean(np.abs(K))
+        metric_reg, d_metric = metric_reg_and_grad(K, G, H, W, gamma_metric)
+
+        loss = mse + mdl + metric_reg
+
+        d_pred = (2.0 / target.shape[0]) * (pred - target)
+        dK = d_pred * texture + lam_mdl * np.sign(K) + d_metric
+        dlog = dK * (K * (1.0 - K))
+
+        dw = (X.T @ dlog).astype(np.float32) / X.shape[0]
+        db = np.mean(dlog).astype(np.float32)
+        model.step(dw, db, lr)
+
+    K, _ = model.forward(X)
+    pred = K * texture
+    mse = np.mean((pred - target) ** 2)
+    return model, K, float(mse)
+
+
+def estimate_contraction_kappa(logits, step_fn, eps=1e-3, trials=2, seed=0):
+    rng = np.random.default_rng(seed)
+    base = logits.copy()
+    base_next = step_fn(base)
+    kappa_est = 0.0
+    for _ in range(trials):
+        delta = eps * rng.standard_normal(base.shape).astype(np.float32)
+        a = base + delta
+        b = base - delta
+        a_next = step_fn(a)
+        b_next = step_fn(b)
+        num = np.linalg.norm(a_next - b_next)
+        den = np.linalg.norm(a - b) + 1e-9
+        kappa_est = max(kappa_est, float(num / den))
+    return kappa_est, base_next
+
+
+def train_mlp_two_stage(
+    X, e_eff, S0, I0, H, W,
+    epochs_diff=80, epochs_proj=160, lr=0.08, seed=1,
+    lam=2.0, eta_tv=0.02, c_pos=0.10, c_neg=0.14,
+    gamma_metric=0.03, beta_I=2.0, beta_S=1.0,
+    gamma_tern=0.0, mu_contract=0.05, kappa_target=0.97,
+    armijo=1e-4, backtrack=12
+):
+    model = TinyMLP(X.shape[1], Hh=16, seed=seed)
+    rng = np.random.default_rng(seed + 123)
+
+    # Stage 1: diffusion-style exploration (noise + SGD)
+    for _ in range(epochs_diff):
+        logits, h = model.forward(X)
+        logits = logits + 0.05 * rng.standard_normal(logits.shape).astype(np.float32)
+        loss, dlog, _ = mdl_loss_and_grad_logits(
+            logits, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+            c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+            gamma_tern=gamma_tern
+        )
+        dh = (dlog[:, None] @ model.W2.T) * (1.0 - h * h)
+        dW2 = (h.T @ dlog[:, None]).astype(np.float32) / X.shape[0]
+        db2 = np.mean(dlog).astype(np.float32)
+        dW1 = (X.T @ dh).astype(np.float32) / X.shape[0]
+        db1 = np.mean(dh, axis=0).astype(np.float32)
+        model.step((dW1, db1, dW2, np.array([db2], dtype=np.float32)), lr)
+
+    # Stage 2: projection contraction with metric-aware step + Armijo
+    G = metric_map_from_signals(I0.reshape(H, W), S0.reshape(H, W), beta_I=beta_I, beta_S=beta_S)
+    G_flat = G.reshape(-1)
+
+    for _ in range(epochs_proj):
+        logits, h = model.forward(X)
+        loss, dlog, _ = mdl_loss_and_grad_logits(
+            logits, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+            c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+            gamma_tern=gamma_tern
+        )
+
+        # metric-aware preconditioning (acts as natural-gradient direction in logits)
+        step_dir = dlog / (G_flat + 1e-6)
+        base_lr = lr
+
+        def step_logits(log_in):
+            return log_in - base_lr * (step_dir * 1.0)
+
+        kappa_est, _ = estimate_contraction_kappa(logits, step_logits, eps=1e-3, trials=2, seed=seed)
+        if kappa_est > kappa_target:
+            lr = lr * 0.5
+
+        accepted = False
+        for _ in range(backtrack):
+            trial = logits - lr * step_dir
+            trial_loss, _, _ = mdl_loss_and_grad_logits(
+                trial, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+                c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+                gamma_tern=gamma_tern
+            )
+            contract_pen = mu_contract * max(0.0, kappa_est - kappa_target) ** 2
+            if trial_loss + contract_pen <= loss:
+                # backprop using preconditioned direction
+                dlog_pre = step_dir
+                dh = (dlog_pre[:, None] @ model.W2.T) * (1.0 - h * h)
+                dW2 = (h.T @ dlog_pre[:, None]).astype(np.float32) / X.shape[0]
+                db2 = np.mean(dlog_pre).astype(np.float32)
+                dW1 = (X.T @ dh).astype(np.float32) / X.shape[0]
+                db1 = np.mean(dh, axis=0).astype(np.float32)
+                model.step((dW1, db1, dW2, np.array([db2], dtype=np.float32)), lr)
+                accepted = True
+                break
+            lr *= 0.5
+
+        if not accepted:
+            break
+
+    logits, _ = model.forward(X)
+    loss, _, m = mdl_loss_and_grad_logits(
+        logits, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+        c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+        gamma_tern=gamma_tern
+    )
+    return model, m, loss
+
+
+def train_logistic(X, e_eff, S0, I0, H, W, epochs=200, lr=0.2, seed=0,
+                   lam=2.0, eta_tv=0.02, c_pos=0.10, c_neg=0.14,
+                   gamma_metric=0.03, beta_I=2.0, beta_S=1.0,
+                   gamma_tern=0.0):
     model = LogisticMask(X.shape[1], seed=seed)
     for _ in range(epochs):
         logits = model.forward(X)
         loss, dlog, _ = mdl_loss_and_grad_logits(
-            logits, e_eff, S0, H, W, lam=lam, eta_tv=eta_tv, c_pos=c_pos, c_neg=c_neg
+            logits, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+            c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+            gamma_tern=gamma_tern
         )
         dw = (X.T @ dlog).astype(np.float32) / X.shape[0]
         db = np.mean(dlog).astype(np.float32)
         model.step(dw, db, lr)
     logits = model.forward(X)
     loss, _, m = mdl_loss_and_grad_logits(
-        logits, e_eff, S0, H, W, lam=lam, eta_tv=eta_tv, c_pos=c_pos, c_neg=c_neg
+        logits, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+        c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+        gamma_tern=gamma_tern
     )
     return model, m, loss
 
 
-def train_mlp(X, e_eff, S0, H, W, epochs=250, lr=0.08, seed=1,
-              lam=2.0, eta_tv=0.02, c_pos=0.10, c_neg=0.14):
+def train_mlp(X, e_eff, S0, I0, H, W, epochs=250, lr=0.08, seed=1,
+              lam=2.0, eta_tv=0.02, c_pos=0.10, c_neg=0.14,
+              gamma_metric=0.03, beta_I=2.0, beta_S=1.0,
+              gamma_tern=0.0):
     model = TinyMLP(X.shape[1], Hh=16, seed=seed)
     for _ in range(epochs):
         logits, h = model.forward(X)
         loss, dlog, _ = mdl_loss_and_grad_logits(
-            logits, e_eff, S0, H, W, lam=lam, eta_tv=eta_tv, c_pos=c_pos, c_neg=c_neg
+            logits, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+            c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+            gamma_tern=gamma_tern
         )
         dh = (dlog[:, None] @ model.W2.T) * (1.0 - h * h)
         dW2 = (h.T @ dlog[:, None]).astype(np.float32) / X.shape[0]
@@ -399,7 +608,51 @@ def train_mlp(X, e_eff, S0, H, W, epochs=250, lr=0.08, seed=1,
         model.step((dW1, db1, dW2, np.array([db2], dtype=np.float32)), lr)
     logits, _ = model.forward(X)
     loss, _, m = mdl_loss_and_grad_logits(
-        logits, e_eff, S0, H, W, lam=lam, eta_tv=eta_tv, c_pos=c_pos, c_neg=c_neg
+        logits, e_eff, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+        c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+        gamma_tern=gamma_tern
+    )
+    return model, m, loss
+
+
+def train_mlp_with_refinement(X, e_eff, S0, I0, H, W, l1, l1_w,
+                              epochs=250, lr=0.08, seed=1,
+                              lam=2.0, eta_tv=0.02, c_pos=0.10, c_neg=0.14,
+                              gamma_metric=0.03, beta_I=2.0, beta_S=1.0,
+                              gamma_tern=0.0, refine_every=25, refine_boost=1.5):
+    model = TinyMLP(X.shape[1], Hh=16, seed=seed)
+    e_work = e_eff.copy()
+
+    for ep in range(epochs):
+        logits, h = model.forward(X)
+        loss, dlog, _ = mdl_loss_and_grad_logits(
+            logits, e_work, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+            c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+            gamma_tern=gamma_tern
+        )
+        dh = (dlog[:, None] @ model.W2.T) * (1.0 - h * h)
+        dW2 = (h.T @ dlog[:, None]).astype(np.float32) / X.shape[0]
+        db2 = np.mean(dlog).astype(np.float32)
+        dW1 = (X.T @ dh).astype(np.float32) / X.shape[0]
+        db1 = np.mean(dh, axis=0).astype(np.float32)
+        model.step((dW1, db1, dW2, np.array([db2], dtype=np.float32)), lr)
+
+        if refine_every and (ep + 1) % refine_every == 0:
+            logits_r, _ = model.forward(X)
+            m_r = logits_to_mask(logits_r)
+            chosen = (m_r >= 0.5).astype(np.float32)
+            pred = l1_w.copy()
+            pred[chosen > 0] = l1[chosen > 0]
+            err = np.abs(pred - l1).reshape(H, W)
+            err_norm = err / (err.max() + 1e-9)
+            boost = 1.0 + refine_boost * err_norm.reshape(-1)
+            e_work = e_eff * boost
+
+    logits, _ = model.forward(X)
+    loss, _, m = mdl_loss_and_grad_logits(
+        logits, e_work, S0, I0, H, W, lam=lam, eta_tv=eta_tv,
+        c_pos=c_pos, c_neg=c_neg, gamma_metric=gamma_metric, beta_I=beta_I, beta_S=beta_S,
+        gamma_tern=gamma_tern
     )
     return model, m, loss
 
@@ -516,6 +769,16 @@ def main():
     ap.add_argument("--beta", type=float, default=0.90, help="persistence decay")
     ap.add_argument("--lam", type=float, default=2.0, help="distortion weight")
     ap.add_argument("--eta_tv", type=float, default=0.02, help="TV prior weight")
+    ap.add_argument("--gamma_tern", type=float, default=0.02, help="ternary carrier penalty weight")
+    ap.add_argument("--two_stage", action="store_true", help="enable diffusion -> projection training for MLP")
+    ap.add_argument("--epochs_diff", type=int, default=80, help="diffusion stage epochs")
+    ap.add_argument("--epochs_proj", type=int, default=160, help="projection stage epochs")
+    ap.add_argument("--mu_contract", type=float, default=0.05, help="contraction penalty weight")
+    ap.add_argument("--kappa_target", type=float, default=0.97, help="contraction target")
+    ap.add_argument("--train_operator", action="store_true", help="train kernel operator stub on a frame")
+    ap.add_argument("--refine_training", action="store_true", help="enable refinement loop during MLP training")
+    ap.add_argument("--refine_every", type=int, default=25, help="refinement interval (epochs)")
+    ap.add_argument("--refine_boost", type=float, default=1.5, help="error boost multiplier")
     args = ap.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -569,23 +832,48 @@ def main():
 
     print("[train] logistic...")
     _, _, loss_log = train_logistic(
-        Xtr, e_tr, S_tr, H, W,
+        Xtr, e_tr, S_tr, I_tr, H, W,
         epochs=220, lr=0.25, seed=args.seed,
-        lam=args.lam, eta_tv=args.eta_tv
+        lam=args.lam, eta_tv=args.eta_tv, gamma_tern=args.gamma_tern
     )
     print(f"  logistic train loss: {loss_log:.3f}")
 
     print("[train] tiny MLP...")
-    mlp_model, _, loss_mlp = train_mlp(
-        Xtr, e_tr, S_tr, H, W,
-        epochs=260, lr=0.08, seed=args.seed + 1,
-        lam=args.lam, eta_tv=args.eta_tv
-    )
+    if args.refine_training:
+        # use a single training frame to keep TV/metric terms well-defined
+        ref = train_pairs[-1]
+        Xr = ref["X"]
+        err_r = ref["err"].reshape(-1)
+        S_r = ref["S0"].reshape(-1)
+        I_r = ref["I0"].reshape(-1)
+        h_r = ref["h"].reshape(-1)
+        e_r = err_r * (1.0 + args.alpha * I_r) * (1.0 + args.kappa * h_r)
+        mlp_model, _, loss_mlp = train_mlp_with_refinement(
+            Xr, e_r, S_r, I_r, H, W, ref["l1"].reshape(-1), ref["l1_w"].reshape(-1),
+            epochs=260, lr=0.08, seed=args.seed + 1,
+            lam=args.lam, eta_tv=args.eta_tv, gamma_tern=args.gamma_tern,
+            refine_every=args.refine_every, refine_boost=args.refine_boost
+        )
+    elif args.two_stage:
+        mlp_model, _, loss_mlp = train_mlp_two_stage(
+            Xtr, e_tr, S_tr, I_tr, H, W,
+            epochs_diff=args.epochs_diff, epochs_proj=args.epochs_proj,
+            lr=0.08, seed=args.seed + 1,
+            lam=args.lam, eta_tv=args.eta_tv,
+            gamma_tern=args.gamma_tern,
+            mu_contract=args.mu_contract, kappa_target=args.kappa_target
+        )
+    else:
+        mlp_model, _, loss_mlp = train_mlp(
+            Xtr, e_tr, S_tr, I_tr, H, W,
+            epochs=260, lr=0.08, seed=args.seed + 1,
+            lam=args.lam, eta_tv=args.eta_tv, gamma_tern=args.gamma_tern
+        )
     print(f"  mlp train loss: {loss_mlp:.3f}")
 
     # Heldout mask probabilities
     logits_va, _ = mlp_model.forward(Xva)
-    m_va = sigmoid(logits_va)
+    m_va = logits_to_mask(logits_va)
 
     ths, mdl_curve = mdl_proxy_threshold_sweep(m_va, err_va, bits_per_active=0.6, compute_per_active=0.08)
     th_best = ths[np.argmin(mdl_curve)]
@@ -597,11 +885,20 @@ def main():
 
     Xvis = vis["X"]
     logits_vis, _ = mlp_model.forward(Xvis)
-    m_vis = sigmoid(logits_vis).reshape(H, W)
+    m_vis = logits_to_mask(logits_vis).reshape(H, W)
     chosen = (m_vis >= th_best).astype(np.float32)
 
     l1_pred = l1w.copy()
     l1_pred[chosen > 0] = l1[chosen > 0]
+
+    if args.train_operator:
+        print("[train] operator stub...")
+        texture = l1w.reshape(-1).astype(np.float32)
+        target = l1.reshape(-1).astype(np.float32)
+        op_model, K, op_mse = train_operator_stub(
+            Xvis, texture, target, S0, I0, H, W, epochs=240, lr=0.2, seed=args.seed
+        )
+        print(f"  operator stub mse: {op_mse:.4f}")
     err_after = np.abs(l1 - l1_pred)
 
     # Plots
