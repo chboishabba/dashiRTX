@@ -29,6 +29,23 @@ def block_mean(integ, x0, y0, sz):
         total += integ[y0 - 1, x0 - 1]
     return total / (sz * sz)
 
+def synth_moving_fields(N, center, base_noise):
+    yy, xx = np.mgrid[0:N, 0:N]
+    cx, cy = center
+    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2) / (0.45 * N)
+    band = np.abs(r - 0.55) < 0.05
+
+    S = np.zeros((N, N), dtype=np.int8)
+    S[(r >= 0.55) & band] = +1
+    S[(r < 0.55) & band] = -1
+
+    noise_e, noise_I, noise_tex = base_noise
+    e = 0.12 * band.astype(np.float32) + 0.03 * noise_e
+    I = (0.4 * band.astype(np.float32) + 0.6 * noise_I).astype(np.float32)
+    texture = (0.4 * band.astype(np.float32) + 0.6 * noise_tex).astype(np.float32)
+    texture = texture / (texture.max() + 1e-9)
+    m = np.clip(0.15 + 0.9 * band.astype(np.float32) + 0.1 * noise_tex, 0, 1)
+    return e, S, I, texture, m
 
 def dilate_mask(mask, steps=1):
     m = mask.copy()
@@ -92,6 +109,11 @@ def refine_topk(root, err, S, I, topk=4, min_size=4, frontier_weight=2.0, fronti
     return refined
 
 
+def update_leaf_stats(root, e, S, I):
+    for n in qtr.gather_leaves(root):
+        qtr.node_stats(n, e, S, I)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--N", type=int, default=256)
@@ -108,22 +130,36 @@ def main():
     ap.add_argument("--refine_threshold", type=float, default=None, help="refine all leaves with mean error >= threshold")
     ap.add_argument("--show_frontier", action="store_true")
     ap.add_argument("--view", type=str, default="error", choices=["error", "result", "pixel", "diff"])
+    ap.add_argument("--moving_center", action="store_true", help="move ring center over time")
+    ap.add_argument("--move_amp", type=float, default=0.12, help="center motion amplitude as fraction of N")
+    ap.add_argument("--move_period", type=float, default=20.0, help="motion period in steps")
     args = ap.parse_args()
 
     outdir = Path(args.outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
-    e, S, I, texture, m = qtr.synth_fields(args.N, args.N, seed=0)
+    rng = np.random.default_rng(0)
+    base_noise = (
+        rng.random((args.N, args.N), dtype=np.float32),
+        rng.random((args.N, args.N), dtype=np.float32),
+        rng.random((args.N, args.N), dtype=np.float32),
+    )
+
+    center0 = (0.52 * args.N, 0.48 * args.N)
+    e, S, I, texture, m = synth_moving_fields(args.N, center0, base_noise)
     e = e * args.sparsity
     I = I * args.sparsity
     m = m * args.sparsity
     refine_scale = min(8.0, 1.0 / max(args.sparsity, 1e-3))
 
-    frontier = (np.abs(S) > 0).astype(np.float32)
-    kernel = 0.25 + 1.5 * (0.6 * I + 0.4 * frontier) * (0.5 + 0.5 * np.sin(1.2))
-    for _ in range(args.bounce_cost):
-        kernel = np.sin(kernel * 1.13 + 0.1)
-    pix = kernel * texture
+    def compute_pix(Iv, Sv, tex):
+        f = (np.abs(Sv) > 0).astype(np.float32)
+        k = 0.25 + 1.5 * (0.6 * Iv + 0.4 * f) * (0.5 + 0.5 * np.sin(1.2))
+        for _ in range(args.bounce_cost):
+            k = np.sin(k * 1.13 + 0.1)
+        return k * tex, f
+
+    pix, frontier = compute_pix(I, S, texture)
 
     root = qtr.build_quadtree(e, S, I, m, min_size=4, refine_scale=refine_scale)
 
@@ -131,6 +167,14 @@ def main():
     frames = []
 
     for step in range(args.steps + 1):
+        if args.moving_center and step > 0:
+            dx = args.move_amp * args.N * np.sin(2.0 * np.pi * step / args.move_period)
+            dy = args.move_amp * args.N * np.cos(2.0 * np.pi * step / args.move_period)
+            center = (center0[0] + dx, center0[1] + dy)
+            e, S, I, texture, m = synth_moving_fields(args.N, center, base_noise)
+            update_leaf_stats(root, e, S, I)
+            pix, frontier = compute_pix(I, S, texture)
+
         qt = qtr.quadtree_render_numba_full(root, texture, view_param=1.2, bounce_cost=args.bounce_cost)
         err = np.abs(pix - qt)
         q25, q50, q75, q99 = np.quantile(err.reshape(-1), [0.25, 0.50, 0.75, 0.99])
