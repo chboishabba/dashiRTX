@@ -65,7 +65,7 @@ def run_eval(A, perm, seed_index, max_degree):
 
 def main():
     original_A = env["A"]
-    grids = [(2,2), (4,4), (8,4), (16,4), (4,8)]
+    grids = [(2,2), (4,2), (4,4), (8,4), (16,4), (4,8)]
     canonical = []
     randomized = []
     started = time.perf_counter()
