@@ -4,7 +4,9 @@
 The production script must expose a deterministic baseline receipt retaining
 shape-bound digests for A, the identity permutation, V, recovered F, the Krylov
 family K_i, and the resulting sum_i K_i F_i action.  It must also verify the
-Krylov recurrence and equality of stored-vs-streaming action evaluation.
+Krylov recurrence, equality of stored-vs-streaming action evaluation, and exact
+entrywise equality between the original runtime `build_A()` constructor and the
+modular-distance extensional formula intended for the Lean mirror.
 
 This is synthetic/runtime evidence only; it is not exact CADO mksol semantics.
 """
@@ -22,6 +24,9 @@ def test_baseline_binding_receipt() -> None:
     assert r["krylov_recurrence_all_equal"] is True
     assert r["action_stored_equals_streaming"] is True
     assert r["operator_linearity_spotcheck"] is True
+    assert r["lean_style_A_matches_runtime_A"] is True
+    assert r["lean_style_A_mismatch_count"] == 0
+    assert r["lean_style_A_sha256"] == r["A_sha256"]
     assert r["exact_cado_mksol_semantics"] is False
     assert r["boundary"]["runtime_apply_B_is_formal_Lean_M"] is False
     assert r["boundary"]["production_RSA260"] is False
