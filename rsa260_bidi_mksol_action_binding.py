@@ -53,15 +53,7 @@ def build_A() -> np.ndarray:
 
 
 def build_A_extensional() -> np.ndarray:
-    """Entrywise form mirrored by the Lean synthetic-incidence definition.
-
-    For each row r and column c,
-
-      A[r,c] = 1 iff ((c + COLS - base(r)) mod COLS) < degree(r).
-
-    Because every degree is strictly below COLS, this is exactly the cyclic
-    consecutive support used by `build_A()`.
-    """
+    """Entrywise form mirrored by the Lean synthetic-incidence definition."""
     rows = np.arange(ROWS, dtype=np.int64)
     cols = np.arange(COLS, dtype=np.int64)
     bases = ((rows * 2654435761 + 0x9E3779B9) % COLS)[:, None]
@@ -143,7 +135,7 @@ def solve_gf2(M: np.ndarray, b: np.ndarray):
         if r == nr:
             break
     if r < nr:
-        zero = np.where(M[r:].sum(axis=1) == 0)[0]
+        zero = np.where(M[r:].sum(axis=1)==0)[0]
         if zero.size and np.any(b[r:][zero]):
             return None
     x = np.zeros(nc, dtype=np.uint8)
@@ -158,12 +150,12 @@ def fit_degree(seq: np.ndarray, d: int):
     lhs = np.empty((kvals * BLOCK, nu), dtype=np.uint8)
     for k in range(kvals):
         for i in range(BLOCK):
-            lhs[k * BLOCK + i] = seq[k : k + d, i, :].reshape(-1)
+            lhs[k * BLOCK + i] = seq[k:k+d, i, :].reshape(-1)
     F = np.zeros((d, BLOCK, BLOCK), dtype=np.uint8)
     for outj in range(BLOCK):
         rhs = np.empty(kvals * BLOCK, dtype=np.uint8)
         for k in range(kvals):
-            rhs[k * BLOCK : (k + 1) * BLOCK] = seq[k + d, :, outj]
+            rhs[k*BLOCK:(k+1)*BLOCK] = seq[k+d, :, outj]
         sol = solve_gf2(lhs, rhs)
         if sol is None:
             return None
@@ -174,9 +166,9 @@ def fit_degree(seq: np.ndarray, d: int):
 def recurrence_holds(seq: np.ndarray, F: np.ndarray, start: int, end: int) -> bool:
     d = F.shape[0]
     for k in range(start, end - d):
-        acc = seq[k + d].copy()
+        acc = seq[k+d].copy()
         for l in range(d):
-            acc ^= (seq[k + l] @ F[l]) & 1
+            acc ^= (seq[k+l] @ F[l]) & 1
         if acc.any():
             return False
     return True
@@ -205,12 +197,6 @@ def array_sha256(a: np.ndarray) -> str:
 
 
 def coefficient_row_bytes(F: np.ndarray) -> bytes:
-    """Pack every 8x8 GF(2) layer as eight row bytes, little-endian in columns.
-
-    Byte `(layer*8 + row)` has bit `col` equal to `F[layer,row,col]`.
-    This is a transparent exact representation of the 17x8x8 baseline family,
-    independent of the shape-bound numpy array digest.
-    """
     if F.ndim != 3 or F.shape[1:] != (8, 8):
         raise ValueError(f"expected d x 8 x 8 coefficients, got {F.shape}")
     out = bytearray()
@@ -247,6 +233,7 @@ def compute_binding_receipt() -> dict:
     action_from_stored = np.zeros((ROWS, BLOCK), dtype=np.uint8)
     for i in range(degree):
         action_from_stored ^= (K[i] @ F[i]) & 1
+    action_row_bytes = block_row_bytes(action_from_stored)
 
     action_streaming = np.zeros((ROWS, BLOCK), dtype=np.uint8)
     Y = V.copy()
@@ -254,7 +241,6 @@ def compute_binding_receipt() -> dict:
         action_streaming ^= (Y @ F[i]) & 1
         Y = apply_B(Y)
 
-    # Finite executable sanity checks only; they are not formal linearity proofs.
     Y1 = build_block(BASEY ^ (1 << 40))
     Y2 = build_block(BASEY ^ (2 << 40))
     linearity_spotcheck = (
@@ -292,6 +278,10 @@ def compute_binding_receipt() -> dict:
         "coefficient_row_bytes_sha256": hashlib.sha256(F_row_bytes).hexdigest(),
         "krylov_family_sha256": array_sha256(K_stack),
         "action_sha256": array_sha256(action_from_stored),
+        "action_row_bytes_count": len(action_row_bytes),
+        "action_row_bytes_sha256": hashlib.sha256(action_row_bytes).hexdigest(),
+        "action_row_bytes_first16_hex": action_row_bytes[:16].hex(),
+        "action_row_bytes_last16_hex": action_row_bytes[-16:].hex(),
         "coefficient_family_shape": list(F.shape),
         "seed_block_shape": list(V.shape),
         "krylov_block_shape": list(K[0].shape),
