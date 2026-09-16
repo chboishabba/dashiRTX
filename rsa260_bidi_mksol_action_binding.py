@@ -191,6 +191,25 @@ def array_sha256(a: np.ndarray) -> str:
     return h.hexdigest()
 
 
+def coefficient_row_bytes(F: np.ndarray) -> bytes:
+    """Pack every 8x8 GF(2) layer as eight row bytes, little-endian in columns.
+
+    Byte `(layer*8 + row)` has bit `col` equal to `F[layer,row,col]`.
+    This is a transparent exact representation of the 17x8x8 baseline family,
+    independent of the shape-bound numpy array digest.
+    """
+    if F.ndim != 3 or F.shape[1:] != (8, 8):
+        raise ValueError(f"expected d x 8 x 8 coefficients, got {F.shape}")
+    out = bytearray()
+    for layer in range(F.shape[0]):
+        for row in range(8):
+            value = 0
+            for col in range(8):
+                value |= int(F[layer, row, col]) << col
+            out.append(value)
+    return bytes(out)
+
+
 def compute_binding_receipt() -> dict:
     perm = np.arange(COLS, dtype=np.int64)
     apply_B = make_apply_B(perm)
@@ -199,6 +218,7 @@ def compute_binding_receipt() -> dict:
 
     lean_style_A = build_A_extensional()
     A_mismatch_count = int(np.count_nonzero(A ^ lean_style_A))
+    F_row_bytes = coefficient_row_bytes(F)
 
     V = build_block(BASEY)
     K = [V]
@@ -249,6 +269,9 @@ def compute_binding_receipt() -> dict:
         "permutation_sha256": array_sha256(perm),
         "V_sha256": array_sha256(V),
         "coefficient_family_sha256": array_sha256(F),
+        "coefficient_row_bytes_count": len(F_row_bytes),
+        "coefficient_row_bytes_hex": F_row_bytes.hex(),
+        "coefficient_row_bytes_sha256": hashlib.sha256(F_row_bytes).hexdigest(),
         "krylov_family_sha256": array_sha256(K_stack),
         "action_sha256": array_sha256(action_from_stored),
         "coefficient_family_shape": list(F.shape),
