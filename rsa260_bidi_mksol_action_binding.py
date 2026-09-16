@@ -88,6 +88,19 @@ def build_block(seed: int) -> np.ndarray:
     return np.stack([seed_vec(seed ^ (j << 32)) for j in range(BLOCK)], axis=1)
 
 
+def block_row_bytes(block: np.ndarray) -> bytes:
+    """Pack an n x 8 GF(2) block as one byte per row, little-endian in columns."""
+    if block.ndim != 2 or block.shape[1] != 8:
+        raise ValueError(f"expected n x 8 block, got {block.shape}")
+    out = bytearray()
+    for row in range(block.shape[0]):
+        value = 0
+        for col in range(8):
+            value |= int(block[row, col]) << col
+        out.append(value)
+    return bytes(out)
+
+
 def make_apply_B(perm: np.ndarray):
     perm = np.asarray(perm)
 
@@ -221,6 +234,7 @@ def compute_binding_receipt() -> dict:
     F_row_bytes = coefficient_row_bytes(F)
 
     V = build_block(BASEY)
+    V_row_bytes = block_row_bytes(V)
     K = [V]
     for _ in range(1, degree):
         K.append(apply_B(K[-1]))
@@ -268,6 +282,10 @@ def compute_binding_receipt() -> dict:
         "lean_style_A_mismatch_count": A_mismatch_count,
         "permutation_sha256": array_sha256(perm),
         "V_sha256": array_sha256(V),
+        "seed_row_bytes_count": len(V_row_bytes),
+        "seed_row_bytes_sha256": hashlib.sha256(V_row_bytes).hexdigest(),
+        "seed_row_bytes_first16_hex": V_row_bytes[:16].hex(),
+        "seed_row_bytes_last16_hex": V_row_bytes[-16:].hex(),
         "coefficient_family_sha256": array_sha256(F),
         "coefficient_row_bytes_count": len(F_row_bytes),
         "coefficient_row_bytes_hex": F_row_bytes.hex(),
