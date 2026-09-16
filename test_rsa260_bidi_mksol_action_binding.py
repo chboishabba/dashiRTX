@@ -22,8 +22,9 @@ def test_baseline_binding_receipt() -> None:
     assert r["krylov_recurrence_all_equal"] is True
     assert r["action_stored_equals_streaming"] is True
     assert r["operator_linearity_spotcheck"] is True
-    assert r["boundary"]["exact_cado_mksol_semantics"] is False
-    assert r["boundary"]["production_rsa260"] is False
+    assert r["exact_cado_mksol_semantics"] is False
+    assert r["boundary"]["runtime_apply_B_is_formal_Lean_M"] is False
+    assert r["boundary"]["production_RSA260"] is False
 
 
 if __name__ == "__main__":
