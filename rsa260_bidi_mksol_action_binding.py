@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 """Hash-bound synthetic Block-Wiedemann/mksol action binding receipt.
 
-This producer specializes the existing `rsa260_bidi_candidate_robustness.py`
-carrier to one deterministic baseline context and retains enough identity
-information to bind the runtime objects to the generic Lean action
+This is a synthetic diagnostic, not CADO-NFS production semantics.  It retains
+one exact executable context linking:
 
-    F |-> sum_i (M^i V) F_i.
+  apply_B, V, recovered F_i, K_0 = V, K_{i+1} = apply_B(K_i),
+  action = XOR_i K_i F_i.
 
-It is intentionally synthetic.  It does not claim exact CADO mksol semantics,
-production RSA-260 custody, or a Lean/Agda same-object theorem.
+The purpose is to provide a concrete same-runtime object for the Lean generic
+map F |-> sum_i (M^i V) F_i.  Cross-prover identity remains a separate proof.
 """
-
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
-
 import numpy as np
 
 ROWS, COLS = 924, 512
@@ -24,6 +21,7 @@ BLOCK, TERMS, TRAIN_LAST, MAXD = 8, 256, 191, 40
 MASK = (1 << 64) - 1
 BASEX = 0xBB67AE8584CAA73B
 BASEY = 0x3C6EF372FE94F82B
+SCHEMA = "rsa260-bidi-mksol-action-binding-v1"
 
 
 def mix64(x: int) -> int:
@@ -65,7 +63,7 @@ def build_block(seed: int) -> np.ndarray:
 
 
 def make_apply_B(perm: np.ndarray):
-    perm = np.asarray(perm, dtype=np.int64)
+    perm = np.asarray(perm)
 
     def apply(Y: np.ndarray) -> np.ndarray:
         T = (A.T @ Y) & 1
@@ -84,7 +82,7 @@ def gen_seq(apply, xseed: int, yseed: int) -> np.ndarray:
     return seq
 
 
-def solve_gf2(M: np.ndarray, b: np.ndarray) -> np.ndarray | None:
+def solve_gf2(M: np.ndarray, b: np.ndarray):
     M, b = M.copy(), b.copy()
     nr, nc = M.shape
     piv, r = [], 0
@@ -115,7 +113,7 @@ def solve_gf2(M: np.ndarray, b: np.ndarray) -> np.ndarray | None:
     return x
 
 
-def fit_degree(seq: np.ndarray, d: int) -> np.ndarray | None:
+def fit_degree(seq: np.ndarray, d: int):
     kvals = TRAIN_LAST - d + 1
     nu = BLOCK * d
     lhs = np.empty((kvals * BLOCK, nu), dtype=np.uint8)
@@ -145,7 +143,7 @@ def recurrence_holds(seq: np.ndarray, F: np.ndarray, start: int, end: int) -> bo
     return True
 
 
-def first_generator(seq: np.ndarray) -> tuple[int, np.ndarray]:
+def first_generator_with_coefficients(seq: np.ndarray):
     for d in range(1, MAXD + 1):
         F = fit_degree(seq, d)
         if F is None:
@@ -154,11 +152,10 @@ def first_generator(seq: np.ndarray) -> tuple[int, np.ndarray]:
             holdout_start = TRAIN_LAST + 1 - d
             if recurrence_holds(seq, F, holdout_start, TERMS):
                 return d, F
-    raise RuntimeError("no generator")
+    raise RuntimeError("no generator found")
 
 
-def array_digest(a: np.ndarray) -> str:
-    """Digest shape, dtype and exact bytes so carrier identity is explicit."""
+def array_sha256(a: np.ndarray) -> str:
     h = hashlib.sha256()
     h.update(str(tuple(int(x) for x in a.shape)).encode("ascii"))
     h.update(b"|")
@@ -168,81 +165,71 @@ def array_digest(a: np.ndarray) -> str:
     return h.hexdigest()
 
 
-def coefficient_action_from_stored_krylov(K: list[np.ndarray], F: np.ndarray) -> np.ndarray:
-    out = np.zeros_like(K[0])
-    for i in range(F.shape[0]):
-        out ^= (K[i] @ F[i]) & 1
-    return out
-
-
-def coefficient_action_streaming(apply, V: np.ndarray, F: np.ndarray) -> np.ndarray:
-    out = np.zeros_like(V)
-    Y = V.copy()
-    for i in range(F.shape[0]):
-        out ^= (Y @ F[i]) & 1
-        Y = apply(Y)
-    return out
-
-
-def compute_binding_receipt() -> dict[str, Any]:
+def compute_binding_receipt() -> dict:
     perm = np.arange(COLS, dtype=np.int64)
-    apply = make_apply_B(perm)
-    seq = gen_seq(apply, BASEX, BASEY)
-    degree, F = first_generator(seq)
+    apply_B = make_apply_B(perm)
+    seq = gen_seq(apply_B, BASEX, BASEY)
+    degree, F = first_generator_with_coefficients(seq)
 
     V = build_block(BASEY)
-    K = [V.copy()]
+    K = [V]
     for _ in range(1, degree):
-        K.append(apply(K[-1]))
+        K.append(apply_B(K[-1]))
+    K_stack = np.stack(K, axis=0)
 
-    recurrence_flags = [
-        np.array_equal(K[i + 1], apply(K[i])) for i in range(degree - 1)
-    ]
-    stored_action = coefficient_action_from_stored_krylov(K, F)
-    streaming_action = coefficient_action_streaming(apply, V, F)
-
-    # Deterministic linearity spot check on the actual runtime operator.
-    X = build_block(BASEX)
-    Y = build_block(BASEY)
-    operator_linearity_spotcheck = np.array_equal(
-        apply(X ^ Y), apply(X) ^ apply(Y)
+    recurrence_ok = all(
+        np.array_equal(K[i + 1], apply_B(K[i])) for i in range(degree - 1)
     )
 
-    Kstack = np.stack(K, axis=0)
+    action_from_stored = np.zeros((ROWS, BLOCK), dtype=np.uint8)
+    for i in range(degree):
+        action_from_stored ^= (K[i] @ F[i]) & 1
+
+    action_streaming = np.zeros((ROWS, BLOCK), dtype=np.uint8)
+    Y = V.copy()
+    for i in range(degree):
+        action_streaming ^= (Y @ F[i]) & 1
+        Y = apply_B(Y)
+
+    # Finite executable sanity checks only; they are not formal linearity proofs.
+    Y1 = build_block(BASEY ^ (1 << 40))
+    Y2 = build_block(BASEY ^ (2 << 40))
+    linearity_spotcheck = (
+        np.array_equal(apply_B(Y1 ^ Y2), apply_B(Y1) ^ apply_B(Y2))
+        and not apply_B(np.zeros_like(Y1)).any()
+    )
+
     return {
-        "schema": "rsa260-bidi-mksol-action-binding-v1",
-        "runtime_source_donor": "rsa260_bidi_candidate_robustness.py",
-        "context": "identity adapter / BASEX / BASEY",
+        "schema": SCHEMA,
+        "synthetic_only": True,
+        "exact_cado_mksol_semantics": False,
         "rows": ROWS,
         "cols": COLS,
         "block": BLOCK,
-        "degree": degree,
+        "degree": int(degree),
+        "operator_formula": "Y -> A @ ((A.T @ Y)[perm]) mod 2",
+        "permutation": "identity",
+        "A_sha256": array_sha256(A),
+        "permutation_sha256": array_sha256(perm),
+        "V_sha256": array_sha256(V),
+        "coefficient_family_sha256": array_sha256(F),
+        "krylov_family_sha256": array_sha256(K_stack),
+        "action_sha256": array_sha256(action_from_stored),
         "coefficient_family_shape": list(F.shape),
         "seed_block_shape": list(V.shape),
         "krylov_block_shape": list(K[0].shape),
-        "krylov_family_shape": list(Kstack.shape),
-        "action_shape": list(stored_action.shape),
-        "krylov_recurrence_all_equal": all(recurrence_flags),
+        "action_shape": list(action_from_stored.shape),
+        "krylov_recurrence_all_equal": bool(recurrence_ok),
         "action_stored_equals_streaming": bool(
-            np.array_equal(stored_action, streaming_action)
+            np.array_equal(action_from_stored, action_streaming)
         ),
-        "operator_linearity_spotcheck": bool(operator_linearity_spotcheck),
-        "digests": {
-            "A": array_digest(A),
-            "identity_permutation": array_digest(perm),
-            "V": array_digest(V),
-            "F_family": array_digest(F),
-            "K_family": array_digest(Kstack),
-            "action": array_digest(stored_action),
-        },
+        "operator_linearity_spotcheck": bool(linearity_spotcheck),
         "boundary": {
-            "synthetic_runtime_binding_executed": True,
-            "exact_cado_mksol_semantics": False,
-            "runtime_apply_B_is_formal_lean_M": False,
-            "runtime_V_is_formal_lean_V": False,
-            "runtime_F_is_formal_lean_coefficient_family": False,
-            "runtime_action_is_formal_lean_krylov_action": False,
-            "production_rsa260": False,
+            "runtime_apply_B_is_formal_Lean_M": False,
+            "runtime_V_is_formal_Lean_V": False,
+            "runtime_F_is_formal_Lean_coefficient_family": False,
+            "runtime_action_is_formal_Lean_krylovCoefficientFamilyAction": False,
+            "production_RSA260": False,
         },
     }
 
