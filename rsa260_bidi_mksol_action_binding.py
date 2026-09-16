@@ -34,14 +34,40 @@ def mix64(x: int) -> int:
     return x & MASK
 
 
+def row_degree(r: int) -> int:
+    return 151 if r < 6 else 150
+
+
+def row_base(r: int) -> int:
+    return (r * 2654435761 + 0x9E3779B9) % COLS
+
+
 def build_A() -> np.ndarray:
     A = np.zeros((ROWS, COLS), dtype=np.uint8)
     for r in range(ROWS):
-        deg = 151 if r < 6 else 150
-        base = (r * 2654435761 + 0x9E3779B9) % COLS
+        deg = row_degree(r)
+        base = row_base(r)
         idx = (base + np.arange(deg)) % COLS
         A[r, idx] = 1
     return A
+
+
+def build_A_extensional() -> np.ndarray:
+    """Entrywise form mirrored by the Lean synthetic-incidence definition.
+
+    For each row r and column c,
+
+      A[r,c] = 1 iff ((c + COLS - base(r)) mod COLS) < degree(r).
+
+    Because every degree is strictly below COLS, this is exactly the cyclic
+    consecutive support used by `build_A()`.
+    """
+    rows = np.arange(ROWS, dtype=np.int64)
+    cols = np.arange(COLS, dtype=np.int64)
+    bases = ((rows * 2654435761 + 0x9E3779B9) % COLS)[:, None]
+    degrees = np.where(rows < 6, 151, 150)[:, None]
+    cyclic_distance = (cols[None, :] + COLS - bases) % COLS
+    return (cyclic_distance < degrees).astype(np.uint8)
 
 
 A = build_A()
@@ -171,6 +197,9 @@ def compute_binding_receipt() -> dict:
     seq = gen_seq(apply_B, BASEX, BASEY)
     degree, F = first_generator_with_coefficients(seq)
 
+    lean_style_A = build_A_extensional()
+    A_mismatch_count = int(np.count_nonzero(A ^ lean_style_A))
+
     V = build_block(BASEY)
     K = [V]
     for _ in range(1, degree):
@@ -209,7 +238,14 @@ def compute_binding_receipt() -> dict:
         "degree": int(degree),
         "operator_formula": "Y -> A @ ((A.T @ Y)[perm]) mod 2",
         "permutation": "identity",
+        "A_constructor_formula":
+            "A[r,c]=1 iff ((c+512-base(r)) mod 512)<degree(r); "
+            "base(r)=(2654435761*r+0x9e3779b9) mod 512; "
+            "degree(r)=151 if r<6 else 150",
         "A_sha256": array_sha256(A),
+        "lean_style_A_sha256": array_sha256(lean_style_A),
+        "lean_style_A_matches_runtime_A": bool(np.array_equal(A, lean_style_A)),
+        "lean_style_A_mismatch_count": A_mismatch_count,
         "permutation_sha256": array_sha256(perm),
         "V_sha256": array_sha256(V),
         "coefficient_family_sha256": array_sha256(F),
